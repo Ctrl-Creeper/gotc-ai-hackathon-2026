@@ -112,6 +112,13 @@ class EventService:
         self.secure = parsed.scheme == "https"
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.data_dir, 0o700)
+        shared_file = self.data_dir / "shared-login-codes.json"
+        self.shared_login_codes = json.loads(shared_file.read_text(encoding="utf-8")) if shared_file.exists() else {}
+        if not isinstance(self.shared_login_codes, dict) or not set(self.shared_login_codes).issubset({"admin", "judge"}):
+            raise ValueError("Shared login configuration supports admin and judge roles only")
+        for value in self.shared_login_codes.values():
+            if not isinstance(value, str) or not 6 <= len(value) <= 160 or value != value.strip():
+                raise ValueError("Shared login codes must contain 6 to 160 characters")
         self.db_path = self.data_dir / "event.sqlite3"
         self.rate_lock = threading.Lock()
         self.login_attempts = defaultdict(deque)
@@ -128,6 +135,24 @@ class EventService:
                     stream.write("GOTC administrator access code (keep private):\n" + code + "\n")
                 os.chmod(access_file, 0o600)
                 self.audit(db, account, "bootstrap")
+            for role, code in self.shared_login_codes.items():
+                for account in db.execute("SELECT * FROM accounts WHERE role=?", (role,)).fetchall():
+                    if not hmac.compare_digest(scrypt_hash(code, account["salt"]), account["code_hash"]):
+                        salt = secrets.token_bytes(16)
+                        db.execute("UPDATE accounts SET salt=?,code_hash=? WHERE id=?", (salt, scrypt_hash(code, salt), account["id"]))
+                        db.execute("DELETE FROM sessions WHERE account_id=?", (account["id"],))
+                        self.audit(db, account, "credential.shared-code-updated")
+            if "judge" in self.shared_login_codes and not db.execute("SELECT 1 FROM accounts WHERE role='judge'").fetchone():
+                account, _ = self.create_account(db, "judge", "评委01")
+                self.audit(db, account, "bootstrap.shared-judge")
+        if "admin" in self.shared_login_codes:
+            access_file = self.data_dir / "admin-access.txt"
+            temporary = self.data_dir / (".admin-access-" + secrets.token_hex(8))
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write("GOTC administrator access code (keep private):\n" + self.shared_login_codes["admin"] + "\n")
+            os.replace(temporary, access_file)
+            os.chmod(access_file, 0o600)
         os.chmod(self.db_path, 0o600)
 
     @contextmanager
@@ -158,7 +183,7 @@ class EventService:
 
     def create_account(self, db, role, name):
         account_id = {"admin": "GA", "judge": "GJ", "audience": "GV"}[role] + secrets.token_hex(8)
-        code = account_id + "." + secrets.token_urlsafe(32)
+        code = self.shared_login_codes.get(role) or account_id + "." + secrets.token_urlsafe(32)
         salt = secrets.token_bytes(16)
         db.execute("INSERT INTO accounts(id,role,name,salt,code_hash,created_at) VALUES (?,?,?,?,?,?)",
                    (account_id, role, name, salt, scrypt_hash(code, salt), now_ms()))
@@ -235,7 +260,17 @@ class EventService:
                     raise APIError(400, "登录身份不正确")
                 self.rate_limit(ip, role)
                 code = text_field(body.get("code"), "邀请码", 160, True)
-                selector = code.split(".", 1)[0]
+                selector = body.get("accountId")
+                if selector is not None and (not isinstance(selector, str) or len(selector) > 80):
+                    raise APIError(400, "登录身份不正确")
+                shared_code = self.shared_login_codes.get(role)
+                if selector is None and shared_code and hmac.compare_digest(code.encode(), shared_code.encode()):
+                    candidates = db.execute("SELECT id,name FROM accounts WHERE role=? AND active=1 ORDER BY created_at,id", (role,)).fetchall()
+                    if len(candidates) > 1:
+                        return {"selectAccount": True, "accounts": [{"id": a["id"], "name": a["name"]} for a in candidates]}, None, None
+                    if candidates:
+                        selector = candidates[0]["id"]
+                selector = selector or code.split(".", 1)[0]
                 account = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (selector, role)).fetchone()
                 salt = account["salt"] if account else b"gotc-dummy-salt!"
                 hashed = scrypt_hash(code, salt)
