@@ -247,7 +247,16 @@ def main():
         nginx_changed = True
         run('nginx', '-t')
         run('systemctl', 'reload', 'nginx')
-        status = health('https://8.141.114.201/gotc/api/board')
+        # systemctl reload returns before Nginx's new workers accept requests.
+        # An immediate connection can still reach an old worker's routing table.
+        for attempt in range(5):
+            try:
+                status = health('https://8.141.114.201/gotc/api/board')
+                break
+            except Exception:
+                if attempt == 4:
+                    raise
+                time.sleep(1)
         run('systemctl', 'is-active', *OLD_SERVICES, 'gotc-hackathon')
         run('systemctl', 'enable', 'gotc-hackathon')
         metadata = {'release': args.release, 'sourceSha': args.source_sha, 'archiveSha256': args.sha256,
