@@ -28,7 +28,7 @@ for file in ('index.html', 'platform.html'):
         if url.scheme or url.netloc:
             assert url.scheme == 'https', f'Insecure public URL: {ref}'
             continue
-        if file == 'platform.html' and url.fragment in {'board','judge','audience','admin'}:
+        if file == 'platform.html' and url.fragment in {'board','team','judge','audience','admin'}:
             continue
         if url.path.startswith('api/'):
             continue
