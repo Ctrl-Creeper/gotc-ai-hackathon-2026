@@ -6,7 +6,7 @@ import secrets
 
 from errors import APIError
 
-STAGES={"exhibition":"展示评审"}
+STAGES={"exhibition":"展示评审","roadshow":"路演评审"}
 DIMENSION_NAMES=[("problem","问题价值与理解"),("ai","方案与AI使用"),("prototype","原型完成度"),
                  ("testing","测试与改进"),("opensource","开源与责任"),("teamwork","团队协作与表达")]
 BLOCKER="评分数值与计算规则尚未实现，不能发布成绩、排名或晋级"
@@ -65,7 +65,8 @@ class JudgingService:
 
     def stage_view(self, state):
         return {"id":state["stage"],"name":STAGES[state["stage"]],"runId":state["run_id"],"revision":state["revision"],
-                "rulesStatus":"unconfigured","rosterEditable":not state["open"] and state["frozen_at"] is None and state["review_count"]==0,"dimensions":[{"id":key,"name":name,"max":None} for key,name in DIMENSION_NAMES],
+                "rulesStatus":"unconfigured","rosterSource":"manual_worklist","advancementStatus":"unimplemented",
+                "rosterEditable":not state["open"] and state["frozen_at"] is None and state["review_count"]==0,"dimensions":[{"id":key,"name":name,"max":None} for key,name in DIMENSION_NAMES],
                 "minValidJudges":None,"aggregation":None,"advancementQuota":None,
                 "capabilities":{"reviewRecords":True,"numericScoring":False,"aggregation":False,"ranking":False,"publication":False}}
 
