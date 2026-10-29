@@ -99,7 +99,32 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 旧版数据库会先经 SQLite backup API 备份到私有数据目录的 `before-team-*.sqlite3`，再事务重建 `accounts` 的角色约束；保留账号 ID、密码哈希、会话、评分、投票、队伍和审计，通过外键检查后提交，失败回滚并停止启动。重复启动跳过已完成迁移。升级前仍建议进行常规备份，保留整个持久化目录；备份不会被静态服务公开。
 
-## 评分语义
+## 展示评审框架
+
+新版展示入口使用 `/api/judging/exhibition`。它保存真实的定性评审记录，**数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成假成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
+
+现有 `/api/score`、`/api/judge`、`/api/board` 和评分 CSV 保留为旧单阶段兼容接口。旧分数既不迁入新展示轮次，也不参与新版进度页；兼容接口的写入仍只保存到旧 `scores` 表。主界面使用新版展示接口，不能把历史旧分数当作本轮正式结果。
+
+| 方法与路径 | 身份 | 合同 |
+|---|---|---|
+| GET `/api/judging/exhibition` | 本轮获权评委 | `{stage,teams,myReviews,window}` |
+| POST `/api/judging/exhibition/review` | 本轮获权评委 | `{runId,teamId,expectedVersion,status,feedback,scores:null}` → `{ok,stage,teams,myReviews,window}` |
+| GET `/api/judging/exhibition/board` | 公开 | `{stage,window,teams,publication}`；仅完成进度，score/rank 全为 null |
+| GET `/api/admin/judging/exhibition` | 管理员 | `{stage,window,roster,teams,judges,reviews,blockers}` |
+| POST `/api/admin/judging/exhibition/roster` | 管理员 | `{expectedRevision,teamIds,judgeIds}` |
+| POST `/api/admin/judging/exhibition/window` | 管理员 | `{expectedRevision,open,deadline}` |
+| POST `/api/admin/judging/exhibition/reset` | 管理员 | `{expectedRevision,reason}`，新建关闭的轮次，保留旧记录 |
+| POST `/api/admin/judging/exhibition/publish` | 管理员 | `{runId}`，返回 409，明确尚未实现 |
+
+管理员写入成功均返回 `{ok:true,...完整管理员状态}`，stage.revision 加一；旧 expectedRevision 返回 409，防止覆盖其他页面设置。首次启动建立关闭、无队伍和评委的展示轮次，不导入旧成绩。名单必须使用现有队伍与有效评委，不能重复；只有窗口关闭、从未开放冻结且没有任何评审记录时才能修改。首次开放后即使尚无评审记录，也需填写理由创建新轮次才能更换名单或重新采集材料。创建新轮次前必须先关闭本轮；新轮次复制工作名单，旧轮次、材料快照与评审记录留在数据库。stage.rosterEditable 明确表示名单当前是否可改，供前端显示，服务端仍在事务中强制校验。
+
+首次开放时复制队伍信息与最近正式材料作为本轮快照，之后提交页面的改动不替换本轮材料。没有正式材料也可记录现场观察；公开进度页不返回材料、评语或评委身份。同一轮次关闭后重新开放只修改窗口，不重新采集或覆盖冻结材料。开放需要非空队伍和评委名单。`window={open,deadline,canEdit,serverTime}`，截止使用 Unix 毫秒或 null，后台按北京时间输入；到点只读。此窗口与作品提交、旧评分和观众投票开关独立。
+
+评审请求明确包含 `scores:null`；任何非空分数（包括空数组）返回 409，因为数值评分未实现。status 只接受 `draft`、`submitted`、`recused`。反馈最多 2000 字，正式定性记录必填，草稿可留空。记录形状为 `{teamId,version,draft,submitted,recused,updatedAt,hasUnsubmittedChanges}`；draft 为 `{feedback}`，submitted 为 `{feedback,submittedAt}`。每次成功写入 version 加一；草稿保留最近正式内容，回避保留内容并从完成计数中排除，后续保存草稿或正式记录解除回避。旧轮次或旧版本请求返回 409，不静默覆盖。
+
+身份、授权、轮次、窗口与记录版本均在同一 SQLite 写事务中核对。新数据使用独立的 `judging_*` 表和阶段标识，不修改原 `scores` 数据。审计记录操作、轮次、版本和管理员重置理由，不复制评审反馈正文。公开 `publication.status` 始终为 `unavailable` 并附阻断原因；配置规则或自动发布的通用规则引擎不在此框架中实现。
+
+## 旧版评分语义（兼容接口）
 
 六维依次为：
 

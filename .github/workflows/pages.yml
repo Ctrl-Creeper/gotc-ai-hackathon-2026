@@ -27,7 +27,7 @@ jobs:
         run: |
           node --check app.js
           node --check platform.js
-          node --test tests/platform.test.mjs
+          node --test tests/*.test.mjs
           python -B scripts/check_site.py
           python -B -m unittest discover -s server -p 'test_*.py'
       - name: Stage public files
