@@ -101,11 +101,11 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 ## 展示与路演评审框架
 
-新版入口使用 `/api/judging/{stage}`，stage 允许 `exhibition`（展示）或 `roadshow`（路演），未知阶段返回 404。它保存定性评审记录，**数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
+新记录入口 `#judge-exhibition`、`#judge-roadshow` 使用 `/api/judging/{stage}`，stage 允许 `exhibition`（展示）或 `roadshow`（路演），未知阶段返回 404；相应进度页为 `#board-exhibition`、`#board-roadshow`。它保存定性评审记录，**仅这些新阶段的数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
 
 两阶段的 run、版本、工作名单、评委授权、窗口、记录和材料快照分别保存。stage 另含 `rosterSource:"manual_worklist"`、`advancementStatus:"unimplemented"`。路演名单由组织方人工配置，可选择任意现有队伍，不要求该队先参加展示；这不构成正式晋级结果。展示关闭、重开或新建轮次不会修改路演，反向也一样，没有自动下游计算。
 
-现有 `/api/score`、`/api/judge`、`/api/board` 和评分 CSV 保留为旧单阶段兼容接口。旧分数既不迁入新展示轮次，也不参与新版进度页；兼容接口的写入仍只保存到旧 `scores` 表。主界面使用新版展示接口，不能把历史旧分数当作本轮正式结果。
+现有 `#judge`、`#board` 继续提供原六维评分与成绩看板，使用 `/api/score`、`/api/judge`、`/api/board`；后台保留 `scoringOpen`、`minJudges`、`resultsPublished` 及原评分 CSV。原分数只保存到 `scores`，既不迁入新阶段，也不参与 `#board-exhibition` 或 `#board-roadshow` 的记录进度。新阶段的 `scores:null` 和发布 409 不适用于原专业评分接口。
 
 | 方法与路径 | 身份 | 合同 |
 |---|---|---|
