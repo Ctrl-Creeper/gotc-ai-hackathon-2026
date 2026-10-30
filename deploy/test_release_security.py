@@ -274,7 +274,10 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
                         except urllib.error.HTTPError as denied: self.assertEqual(denied.code, 401)
                         else: self.fail('unauthenticated team API unexpectedly succeeded')
                         # Exercise authenticated team and legacy judge score paths using synthetic local DB data.
-                        from server import app as source_app
+                        # Import the extracted service with the same sibling-module
+                        # lookup as its real server/app.py process, not the source tree.
+                        with patch.object(sys, 'path', [str(extract / 'server'), *sys.path]):
+                            source_app = load_module('gotc_test_extracted_app', extract / 'server' / 'app.py')
                         data = self.root / 'data'
                         service = source_app.EventService(data_dir=data, origin='https://example.invalid')
                         with service.db() as db:
