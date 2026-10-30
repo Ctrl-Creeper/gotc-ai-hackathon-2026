@@ -99,6 +99,8 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 旧版数据库会先经 SQLite backup API 备份到私有数据目录的 `before-team-*.sqlite3`，再事务重建 `accounts` 的角色约束；保留账号 ID、密码哈希、会话、评分、投票、队伍和审计，通过外键检查后提交，失败回滚并停止启动。重复启动跳过已完成迁移。升级前仍建议进行常规备份，保留整个持久化目录；备份不会被静态服务公开。
 
+完整的保存/冲突处理、URL 字段快照边界、部署检查及三类回退步骤见 [作品提交上线与回退说明](../docs/submission-release.md)。PR1 仅保留最新草稿与最近正式字段，不归档外链内容，也不提供后续评审轮次的冻结能力。保存是否成功以服务端锁后校验与成功响应为准，不能以点击时间判断；409 需要读取最新版本并由用户明确合并，不自动重试。
+
 ## 评分语义
 
 六维依次为：
@@ -130,6 +132,7 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 ```sh
 python3 -B -m unittest discover -s server -p 'test_*.py' -v
+python3 -B -m unittest discover -s deploy -p 'test_*.py' -v
 python3 -m py_compile server/app.py server/test_api.py
 ```
 
