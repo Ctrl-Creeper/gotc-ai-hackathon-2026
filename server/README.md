@@ -101,26 +101,28 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 完整的保存/冲突处理、URL 字段快照边界、部署检查及三类回退步骤见 [作品提交上线与回退说明](../docs/submission-release.md)。作品提交模块保留最新草稿与最近正式字段，不归档外链内容；独立评审轮次的冻结能力见下文。保存是否成功以服务端锁后校验与成功响应为准，不能以点击时间判断；409 需要读取最新版本并由用户明确合并，不自动重试。
 
-## 展示评审框架
+## 展示与路演评审框架
 
-独立展示入口 `platform.html#judge-exhibition` 使用 `/api/judging/exhibition`，进度页为 `#board-exhibition`。它保存真实的定性评审记录，**该新阶段的数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成假成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
+新记录入口 `#judge-exhibition`、`#judge-roadshow` 使用 `/api/judging/{stage}`，stage 允许 `exhibition`（展示）或 `roadshow`（路演），未知阶段返回 404；相应进度页为 `#board-exhibition`、`#board-roadshow`。它保存定性评审记录，**仅这些新阶段的数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
 
-现有 `#judge`、`#board` 继续提供原六维评分与成绩看板，使用 `/api/score`、`/api/judge`、`/api/board`；后台保留 `scoringOpen`、`minJudges`、`resultsPublished` 及原评分 CSV。原分数只保存到 `scores`，既不迁入展示轮次，也不参与 `#board-exhibition` 的记录进度。新阶段的 `scores:null` 和发布 409 不适用于原专业评分接口。
+两阶段的 run、版本、工作名单、评委授权、窗口、记录和材料快照分别保存。stage 另含 `rosterSource:"manual_worklist"`、`advancementStatus:"unimplemented"`。路演名单由组织方人工配置，可选择任意现有队伍，不要求该队先参加展示；这不构成正式晋级结果。展示关闭、重开或新建轮次不会修改路演，反向也一样，没有自动下游计算。
+
+现有 `#judge`、`#board` 继续提供原六维评分与成绩看板，使用 `/api/score`、`/api/judge`、`/api/board`；后台保留 `scoringOpen`、`minJudges`、`resultsPublished` 及原评分 CSV。原分数只保存到 `scores`，既不迁入新阶段，也不参与 `#board-exhibition` 或 `#board-roadshow` 的记录进度。新阶段的 `scores:null` 和发布 409 不适用于原专业评分接口。
 
 | 方法与路径 | 身份 | 合同 |
 |---|---|---|
-| GET `/api/judging/exhibition` | 本轮获权评委 | `{stage,teams,myReviews,window}` |
-| POST `/api/judging/exhibition/review` | 本轮获权评委 | `{runId,teamId,expectedVersion,status,feedback,scores:null}` → `{ok,stage,teams,myReviews,window}` |
-| GET `/api/judging/exhibition/board` | 公开 | `{stage,window,teams,publication}`；仅完成进度，score/rank 全为 null |
-| GET `/api/admin/judging/exhibition` | 管理员 | `{stage,window,roster,teams,judges,reviews,blockers}` |
-| POST `/api/admin/judging/exhibition/roster` | 管理员 | `{expectedRevision,teamIds,judgeIds}` |
-| POST `/api/admin/judging/exhibition/window` | 管理员 | `{expectedRevision,open,deadline}` |
-| POST `/api/admin/judging/exhibition/reset` | 管理员 | `{expectedRevision,reason}`，新建关闭的轮次，保留旧记录 |
-| POST `/api/admin/judging/exhibition/publish` | 管理员 | `{runId}`，返回 409，明确尚未实现 |
+| GET `/api/judging/{stage}` | 本轮获权评委 | `{stage,teams,myReviews,window}` |
+| POST `/api/judging/{stage}/review` | 本轮获权评委 | `{runId,teamId,expectedVersion,status,feedback,scores:null}` → `{ok,stage,teams,myReviews,window}` |
+| GET `/api/judging/{stage}/board` | 公开 | `{stage,window,teams,publication}`；仅完成进度，score/rank 全为 null |
+| GET `/api/admin/judging/{stage}` | 管理员 | `{stage,window,roster,teams,judges,reviews,blockers}` |
+| POST `/api/admin/judging/{stage}/roster` | 管理员 | `{expectedRevision,teamIds,judgeIds}` |
+| POST `/api/admin/judging/{stage}/window` | 管理员 | `{expectedRevision,open,deadline}` |
+| POST `/api/admin/judging/{stage}/reset` | 管理员 | `{expectedRevision,reason}`，新建关闭的轮次，保留旧记录 |
+| POST `/api/admin/judging/{stage}/publish` | 管理员 | `{runId}`，返回 409，明确尚未实现 |
 
-管理员写入成功均返回 `{ok:true,...完整管理员状态}`，stage.revision 加一；旧 expectedRevision 返回 409，防止覆盖其他页面设置。首次启动建立关闭、无队伍和评委的展示轮次，不导入旧成绩。名单必须使用现有队伍与有效评委，不能重复；只有窗口关闭、从未开放冻结且没有任何评审记录时才能修改。首次开放后即使尚无评审记录，也需填写理由创建新轮次才能更换名单或重新采集材料。创建新轮次前必须先关闭本轮；新轮次复制工作名单，旧轮次、材料快照与评审记录留在数据库。stage.rosterEditable 明确表示名单当前是否可改，供前端显示，服务端仍在事务中强制校验。
+管理员写入成功均返回 `{ok:true,...完整管理员状态}`，stage.revision 加一；旧 expectedRevision 返回 409，防止覆盖其他页面设置。首次启动分别建立关闭、无队伍和评委的展示与路演轮次，不导入旧成绩。名单必须使用现有队伍与有效评委，不能重复；只有窗口关闭、从未开放冻结且没有任何评审记录时才能修改。首次开放后即使尚无评审记录，也需填写理由创建新轮次才能更换名单或重新采集材料。创建新轮次前必须先关闭本轮；新轮次复制工作名单，旧轮次、材料快照与评审记录留在数据库。stage.rosterEditable 明确表示名单当前是否可改，供前端显示，服务端仍在事务中强制校验。
 
-首次开放时复制队伍信息与最近正式材料作为本轮快照，之后提交页面的改动不替换本轮材料。没有正式材料也可记录现场观察；公开进度页不返回材料、评语或评委身份。同一轮次关闭后重新开放只修改窗口，不重新采集或覆盖冻结材料。开放需要非空队伍和评委名单。`window={open,deadline,canEdit,serverTime}`，截止使用 Unix 毫秒或 null，后台按北京时间输入；到点只读。此窗口与作品提交、旧评分和观众投票开关独立。
+首次开放时复制队伍信息与最近正式材料作为本轮快照，之后提交页面的改动不替换本轮材料。路演独立截取当时的正式材料，不借用展示快照。没有正式材料也可记录现场观察；公开进度页不返回材料、评语或评委身份。同一轮次关闭后重新开放只修改窗口，不重新采集或覆盖冻结材料。开放需要非空队伍和评委名单。`window={open,deadline,canEdit,serverTime}`，截止使用 Unix 毫秒或 null，后台按北京时间输入；到点只读。此窗口与作品提交、旧评分和观众投票开关独立。
 
 评审请求明确包含 `scores:null`；任何非空分数（包括空数组）返回 409，因为数值评分未实现。status 只接受 `draft`、`submitted`、`recused`。反馈最多 2000 字，正式定性记录必填，草稿可留空。记录形状为 `{teamId,version,draft,submitted,recused,updatedAt,hasUnsubmittedChanges}`；draft 为 `{feedback}`，submitted 为 `{feedback,submittedAt}`。每次成功写入 version 加一；草稿保留最近正式内容，回避保留内容并从完成计数中排除，后续保存草稿或正式记录解除回避。旧轮次或旧版本请求返回 409，不静默覆盖。
 

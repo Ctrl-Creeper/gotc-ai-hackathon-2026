@@ -12,10 +12,10 @@ function context(hash='#judge',role='judge'){
 }
 
 test('original public routes keep numeric board and judge while exhibition uses separate suffixes',async()=>{
-  for(const [hash,expected] of [['','numeric-board'],['#board','numeric-board'],['#judge','numeric-judge'],['#board-exhibition','exhibition-board'],['#judge-exhibition','exhibition-judge']]){
+  for(const [hash,expected] of [['','numeric-board'],['#board','numeric-board'],['#judge','numeric-judge'],['#board-exhibition','exhibition-board'],['#judge-exhibition','exhibition-judge'],['#judge-roadshow','exhibition-judge'],['#board-roadshow','exhibition-board']]){
     const ctx=context(hash);await vm.runInContext('renderRoute()',ctx);assert.equal(ctx.calls[0],expected);
   }
-  for(const hash of ['#judge','#judge-exhibition']){
+  for(const hash of ['#judge','#judge-exhibition','#judge-roadshow']){
     const ctx=context(hash,null);await vm.runInContext('renderRoute()',ctx);assert.equal(ctx.calls[0],'login:judge');
     const wrong=context(hash,'audience');await vm.runInContext('renderRoute()',wrong);assert.equal(wrong.calls[0],'wrong-role:judge');
   }

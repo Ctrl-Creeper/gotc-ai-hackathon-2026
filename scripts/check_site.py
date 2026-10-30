@@ -28,12 +28,12 @@ for file in ('index.html', 'platform.html'):
         if url.scheme or url.netloc:
             assert url.scheme == 'https', f'Insecure public URL: {ref}'
             continue
-        if file == 'platform.html' and url.fragment in {'board','team','judge','board-exhibition','judge-exhibition','audience','admin'}:
-            continue
         if url.path.startswith('api/'):
             continue
         target = ROOT / unquote(url.path) if url.path else ROOT / file
         assert target.is_file(), f'Missing resource: {ref} in {file}'
+        if target == ROOT / 'platform.html' and url.fragment in {'board','team','judge','board-exhibition','judge-exhibition','board-roadshow','judge-roadshow','audience','admin'}:
+            continue
         if url.fragment:
             destination = page
             if url.path:
