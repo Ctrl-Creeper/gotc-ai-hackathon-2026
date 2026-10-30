@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,6 +17,7 @@ jobs:
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -39,6 +41,7 @@ jobs:
   backend:
     name: Backend checks (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -54,3 +57,19 @@ jobs:
         run: python -B -m unittest discover -s server -p 'test_*.py' -v
       - name: Compile Python sources
         run: python -B -m py_compile server/app.py server/test_api.py server/test_shared_login.py scripts/check_site.py deploy/deploy.py deploy/install.py
+
+  hygiene:
+    name: Repository hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Run pre-commit checks
+        uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --all-files
