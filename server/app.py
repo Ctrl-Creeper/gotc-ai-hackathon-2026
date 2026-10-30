@@ -21,6 +21,8 @@ from decimal import Decimal, InvalidOperation
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
+from errors import APIError
+from judging import JudgingService
 
 DIMENSIONS = [
     {"id": "problem", "name": "问题价值与理解", "max": 20},
@@ -80,11 +82,6 @@ CREATE TABLE IF NOT EXISTS audit (
 
 def now_ms():
     return int(time.time() * 1000)
-
-
-class APIError(Exception):
-    def __init__(self, status, message):
-        self.status, self.message = status, message
 
 
 def text_field(value, field, limit, required=False):
@@ -148,9 +145,11 @@ class EventService:
         self.db_path = self.data_dir / "event.sqlite3"
         self.rate_lock = threading.Lock()
         self.login_attempts = defaultdict(deque)
+        self.judging=JudgingService(clock=lambda:now_ms(),text=text_field,audit=self.audit,touch=self.touch)
         self.migrate_accounts()
         with self.db() as db:
             db.executescript(SCHEMA)
+            self.judging.initialize(db)
             for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
                 db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
             if not db.execute("SELECT 1 FROM accounts WHERE role='admin'").fetchone():
@@ -311,6 +310,8 @@ class EventService:
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
             actor = self.account(db, cookie)
+            if path.startswith(("/api/judging/","/api/admin/judging/")):
+                return self.judging.dispatch(db,actor,method,path,body), None, None
             if method == "GET" and path == "/api/session":
                 return {"role": actor["role"] if actor else None, "name": actor["name"] if actor else ""}, None, None
             if method == "GET" and path == "/api/board":
