@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import csv
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import hmac
 import io
@@ -31,6 +31,7 @@ DIMENSIONS = [
     {"id": "teamwork", "name": "团队协作与表达", "max": 10},
 ]
 BODY_LIMIT = 16384
+SUBMISSION_BODY_LIMIT = 32768
 SESSION_SECONDS = 12 * 3600
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"
@@ -39,7 +40,7 @@ ASSET_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", "
 DOWNLOAD_EXTENSIONS = {".ics", ".txt"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
- id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('admin','judge','audience')),
+ id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('admin','judge','audience','team')),
  name TEXT NOT NULL, salt BLOB NOT NULL, code_hash BLOB NOT NULL,
  active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
 );
@@ -50,6 +51,14 @@ CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS teams (
  id TEXT PRIMARY KEY, number INTEGER NOT NULL UNIQUE, name TEXT NOT NULL,
  project TEXT NOT NULL DEFAULT '', track TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS team_accounts (
+ account_id TEXT NOT NULL PRIMARY KEY REFERENCES accounts(id), team_id TEXT NOT NULL UNIQUE REFERENCES teams(id)
+);
+CREATE TABLE IF NOT EXISTS submissions (
+ team_id TEXT PRIMARY KEY REFERENCES teams(id), version INTEGER NOT NULL CHECK(version>=1),
+ draft_json TEXT NOT NULL, submitted_json TEXT, submitted_version INTEGER,
+ first_submitted_at INTEGER, submitted_at INTEGER, updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS scores (
  judge_id TEXT NOT NULL REFERENCES accounts(id), team_id TEXT NOT NULL REFERENCES teams(id),
@@ -87,6 +96,23 @@ def text_field(value, field, limit, required=False):
     return value
 
 
+def valid_material_host(host):
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9.]+", host):
+        return False
+    try:
+        domain=host.rstrip(".").encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return len(domain)<=253 and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label, re.I) for label in domain.split("."))
+
+
 def scrypt_hash(code, salt):
     return hashlib.scrypt(code.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
 
@@ -122,9 +148,10 @@ class EventService:
         self.db_path = self.data_dir / "event.sqlite3"
         self.rate_lock = threading.Lock()
         self.login_attempts = defaultdict(deque)
+        self.migrate_accounts()
         with self.db() as db:
             db.executescript(SCHEMA)
-            for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "updatedAt": now_ms()}.items():
+            for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
                 db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
             if not db.execute("SELECT 1 FROM accounts WHERE role='admin'").fetchone():
                 account, code = self.create_account(db, "admin", "活动管理员")
@@ -155,6 +182,40 @@ class EventService:
             os.chmod(access_file, 0o600)
         os.chmod(self.db_path, 0o600)
 
+    def migrate_accounts(self):
+        """Rebuild only the legacy role CHECK; preserve IDs and referencing tables."""
+        if not self.db_path.exists():
+            return
+        db=sqlite3.connect(self.db_path, timeout=10)
+        try:
+            table=db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'").fetchone()
+            if not table or "'team'" in table[0]:
+                return
+            backup_path=self.data_dir/("before-team-"+str(now_ms())+"-"+secrets.token_hex(4)+".sqlite3")
+            with closing(sqlite3.connect(backup_path)) as backup:
+                db.backup(backup)
+            os.chmod(backup_path, 0o600)
+            db.execute("PRAGMA foreign_keys=OFF")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute("""CREATE TABLE accounts_new (
+                  id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('admin','judge','audience','team')),
+                  name TEXT NOT NULL, salt BLOB NOT NULL, code_hash BLOB NOT NULL,
+                  active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)""")
+                db.execute("INSERT INTO accounts_new SELECT id,role,name,salt,code_hash,active,created_at FROM accounts")
+                db.execute("DROP TABLE accounts")
+                db.execute("ALTER TABLE accounts_new RENAME TO accounts")
+                if db.execute("PRAGMA foreign_key_check").fetchall():
+                    raise RuntimeError("Account migration failed foreign-key validation")
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.execute("PRAGMA foreign_keys=ON")
+        finally:
+            db.close()
+
     @contextmanager
     def db(self):
         db = sqlite3.connect(self.db_path, timeout=10)
@@ -182,7 +243,7 @@ class EventService:
                     action, target, json.dumps(metadata or {}, ensure_ascii=False)))
 
     def create_account(self, db, role, name):
-        account_id = {"admin": "GA", "judge": "GJ", "audience": "GV"}[role] + secrets.token_hex(8)
+        account_id = {"admin": "GA", "judge": "GJ", "audience": "GV", "team": "GT"}[role] + secrets.token_hex(8)
         code = self.shared_login_codes.get(role) or account_id + "." + secrets.token_urlsafe(32)
         salt = secrets.token_bytes(16)
         db.execute("INSERT INTO accounts(id,role,name,salt,code_hash,created_at) VALUES (?,?,?,?,?,?)",
@@ -246,17 +307,18 @@ class EventService:
     def dispatch(self, method, path, body, cookie, ip):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
         with self.db() as db:
+            # Resolve write identities only after the lock: revocation may have committed while queued.
+            if method=="POST":
+                db.execute("BEGIN IMMEDIATE")
             actor = self.account(db, cookie)
             if method == "GET" and path == "/api/session":
                 return {"role": actor["role"] if actor else None, "name": actor["name"] if actor else ""}, None, None
             if method == "GET" and path == "/api/board":
                 config = self.config(db)
                 return {"teams": self.teams(db), "config": config, "updatedAt": config["updatedAt"], "serverTime": now_ms()}, None, None
-            if method == "POST":
-                db.execute("BEGIN IMMEDIATE")
             if method == "POST" and path == "/api/login":
                 role = body.get("role")
-                if role not in {"admin", "judge", "audience"}:
+                if role not in {"admin", "judge", "audience", "team"}:
                     raise APIError(400, "登录身份不正确")
                 self.rate_limit(ip, role)
                 code = text_field(body.get("code"), "邀请码", 160, True)
@@ -294,7 +356,7 @@ class EventService:
                 self.require(actor, "judge")
                 scores = [{"teamId": r["team_id"], "scores": json.loads(r["scores_json"]), "feedback": r["feedback"], "status": r["status"]}
                           for r in db.execute("SELECT * FROM scores WHERE judge_id=?", (actor["id"],))]
-                return {"teams": self.teams(db), "myScores": scores, "dimensions": DIMENSIONS, "scoringOpen": self.config(db)["scoringOpen"], "name": actor["name"]}, None, None
+                return {"teams": self.teams(db), "myScores": scores, "dimensions": DIMENSIONS, "scoringOpen": self.config(db)["scoringOpen"], "name": actor["name"], "submissions": self.judge_submissions(db)}, None, None
             if method == "POST" and path == "/api/score":
                 self.require(actor, "judge")
                 if not self.config(db)["scoringOpen"]:
@@ -334,6 +396,15 @@ class EventService:
                     self.audit(db, actor, "vote", team_id)
                     self.touch(db)
                 return {"ok": True, "alreadyVoted": bool(already)}, None, None
+            if path in {"/api/team", "/api/submission"}:
+                self.require(actor, "team")
+                bound=db.execute("SELECT t.* FROM teams t JOIN team_accounts a ON a.team_id=t.id WHERE a.account_id=?", (actor["id"],)).fetchone()
+                if not bound:
+                    raise APIError(403, "队伍身份未绑定")
+                if method=="GET" and path=="/api/team":
+                    return self.team_submission_response(db, bound), None, None
+                if method=="POST" and path=="/api/submission":
+                    return self.save_submission(db, actor, bound, body), None, None
             if path.startswith("/api/admin"):
                 self.require(actor, "admin")
                 if method == "GET" and path == "/api/admin":
@@ -341,15 +412,18 @@ class EventService:
                               for r in db.execute("SELECT a.id,a.name,a.active,COUNT(s.team_id) AS submitted_count FROM accounts a LEFT JOIN scores s ON s.judge_id=a.id AND s.status='submitted' WHERE a.role='judge' GROUP BY a.id ORDER BY a.created_at")]
                     audience = [{"id": r["id"], "name": r["name"], "active": bool(r["active"])} for r in db.execute("SELECT id,name,active FROM accounts WHERE role='audience' ORDER BY created_at")]
                     stats = {"teamCount": db.execute("SELECT COUNT(*) FROM teams").fetchone()[0], "submittedScores": db.execute("SELECT COUNT(*) FROM scores WHERE status='submitted'").fetchone()[0], "audienceVotes": db.execute("SELECT COUNT(*) FROM votes").fetchone()[0]}
-                    return {"teams": self.teams(db, public=False), "judges": judges, "audience": audience, "config": self.config(db), "stats": stats}, None, None
+                    return {"teams": self.teams(db, public=False), "judges": judges, "audience": audience, "config": self.config(db), "stats": stats, "submissions": self.admin_submissions(db)}, None, None
                 if method == "POST" and path == "/api/admin/settings":
-                    allowed = {"scoringOpen", "resultsPublished", "minJudges"}
+                    allowed = {"scoringOpen", "resultsPublished", "minJudges", "submissionsOpen", "submissionDeadline"}
                     if not body or not set(body).issubset(allowed):
                         raise APIError(400, "设置字段不正确")
                     for key, value in body.items():
                         if key == "minJudges":
                             if type(value) is not int or not 1 <= value <= 50:
                                 raise APIError(400, "最少评委数应为1至50的整数")
+                        elif key=="submissionDeadline":
+                            if value is not None and (type(value) is not int or not 0<=value<=253402300799999):
+                                raise APIError(400, "提交截止时间必须是有效的毫秒时间戳或空值")
                         elif type(value) is not bool:
                             raise APIError(400, "开放与公开状态必须为布尔值")
                         db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), key))
@@ -392,6 +466,11 @@ class EventService:
                     db.execute("DELETE FROM sessions WHERE account_id=?", (account_id,))
                     self.audit(db, actor, "invitation.revoke", account_id, {"role": role})
                     return {"ok": True}, None, None
+                if method=="POST" and path=="/api/admin/team-access":
+                    return self.team_access(db, actor, body), None, None
+                if method=="GET" and path=="/api/admin/submissions/export":
+                    self.audit(db, actor, "submissions.export")
+                    return self.submission_csv(db), None, None
                 if method == "GET" and path == "/api/admin/export":
                     output = io.StringIO(newline="")
                     writer = csv.writer(output)
@@ -404,6 +483,144 @@ class EventService:
                     self.audit(db, actor, "export")
                     return ("\ufeff" + output.getvalue()).encode("utf-8"), None, None
             raise APIError(404, "接口不存在")
+
+    def submission_window(self, db, current=None):
+        config=self.config(db)
+        current=now_ms() if current is None else current
+        return {"submissionsOpen": config["submissionsOpen"], "submissionDeadline": config["submissionDeadline"],
+                "canEdit": config["submissionsOpen"] and (config["submissionDeadline"] is None or current<config["submissionDeadline"]), "serverTime": current}
+
+    def submission(self, db, team_id):
+        row=db.execute("SELECT * FROM submissions WHERE team_id=?", (team_id,)).fetchone()
+        if not row:
+            return {"version": 0, "draft": None, "submitted": None, "submittedVersion": None,
+                    "firstSubmittedAt": None, "submittedAt": None, "updatedAt": None, "hasUnsubmittedChanges": False}
+        draft=json.loads(row["draft_json"]) if row["draft_json"] else None
+        submitted=json.loads(row["submitted_json"]) if row["submitted_json"] else None
+        return {"version": row["version"], "draft": draft, "submitted": submitted, "submittedVersion": row["submitted_version"],
+                "firstSubmittedAt": row["first_submitted_at"], "submittedAt": row["submitted_at"], "updatedAt": row["updated_at"],
+                "hasUnsubmittedChanges": submitted is not None and draft!=submitted}
+
+    def team_submission_response(self, db, team):
+        return {"team": {key: team[key] for key in ("id", "number", "name", "project", "track")},
+                "submission": self.submission(db, team["id"]), "window": self.submission_window(db)}
+
+    def team_access(self, db, actor, body):
+        if set(body)!={"teamId", "action"} or (not isinstance(body.get("action"), str) or body["action"] not in {"issue", "rotate", "revoke"}):
+            raise APIError(400, "提交码操作不正确")
+        team_id=self.team_exists(db, body["teamId"])
+        action=body["action"]
+        account=db.execute("SELECT a.* FROM accounts a JOIN team_accounts t ON t.account_id=a.id WHERE t.team_id=?", (team_id,)).fetchone()
+        if action=="issue":
+            if account:
+                raise APIError(409, "该队已有提交身份，请重发提交码")
+            name=db.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()[0]
+            account,code=self.create_account(db, "team", name)
+            db.execute("INSERT INTO team_accounts VALUES (?,?)", (account["id"], team_id))
+        else:
+            if not account:
+                raise APIError(404, "该队尚未创建提交身份")
+            db.execute("DELETE FROM sessions WHERE account_id=?", (account["id"],))
+            if action=="rotate":
+                code=account["id"]+"."+secrets.token_urlsafe(32)
+                salt=secrets.token_bytes(16)
+                db.execute("UPDATE accounts SET salt=?,code_hash=?,active=1 WHERE id=?", (salt, scrypt_hash(code, salt), account["id"]))
+            else:
+                db.execute("UPDATE accounts SET active=0 WHERE id=?", (account["id"],))
+        self.audit(db, actor, "team-access."+action, team_id)
+        result={"ok": True, "teamId": team_id, "id": account["id"], "active": action!="revoke"}
+        if action!="revoke":
+            result["code"]=code
+        return result
+
+    def check_materials(self, materials, submitted):
+        limits={"projectName": 140, "summary": 600, "license": 200, "demoInstructions": 2000,
+                "sourcesAndLimitations": 2000, "codeVersion": 120}
+        urls=("codeUrl", "readmeUrl", "licenseUrl", "demoUrl", "slidesUrl", "videoUrl")
+        if not isinstance(materials, dict) or not set(materials).issubset({*limits, *urls, "confirmed"}):
+            raise APIError(400, "项目材料字段不正确")
+        result={key: text_field(materials.get(key, ""), key, limit) for key,limit in limits.items()}
+        for key in urls:
+            value=text_field(materials.get(key, ""), key, 1024)
+            if value:
+                try:
+                    parsed=urlsplit(value)
+                    valid=(parsed.scheme=="https" and valid_material_host(parsed.hostname) and parsed.username is None and parsed.password is None
+                           and parsed.port!=0 and len(value.encode("utf-8"))<=1024
+                           and not any(c.isspace() or ord(c)<32 or ord(c)==127 or c=="\\" for c in value)
+                           and not re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f)", value, re.I))
+                except ValueError:
+                    valid=False
+                if not valid:
+                    raise APIError(400, key+"必须是无凭据、无空白的完整 HTTPS 链接（最多1024字节）")
+            result[key]=value
+        confirmed=materials.get("confirmed", False)
+        if type(confirmed) is not bool:
+            raise APIError(400, "提交确认必须为布尔值")
+        result["confirmed"]=confirmed
+        if submitted:
+            required=("projectName", "summary", "codeUrl", "readmeUrl", "license", "slidesUrl", "videoUrl", "sourcesAndLimitations")
+            if any(not result[key] for key in required):
+                raise APIError(400, "正式提交请填写全部必填项目材料")
+            if not result["demoUrl"] and not result["demoInstructions"]:
+                raise APIError(400, "请填写原型演示链接或本地演示说明")
+            if not confirmed:
+                raise APIError(400, "正式提交前请完成材料自查确认")
+        return result
+
+    def save_submission(self, db, actor, team, body):
+        if set(body)!={"expectedVersion", "status", "materials"} or (not isinstance(body.get("status"), str) or body["status"] not in {"draft", "submitted"}):
+            raise APIError(400, "提交字段或状态不正确")
+        if type(body["expectedVersion"]) is not int or body["expectedVersion"]<0:
+            raise APIError(400, "材料版本必须是非负整数")
+        submitted=body["status"]=="submitted"
+        materials=self.check_materials(body["materials"], submitted)
+        current=now_ms()
+        if not self.submission_window(db, current)["canEdit"]:
+            raise APIError(409, "作品提交尚未开放或已截止，当前材料只读")
+        previous=self.submission(db, team["id"])
+        if body["expectedVersion"]!=previous["version"]:
+            raise APIError(409, "材料已被其他页面更新。当前输入已保留，请重新读取并合并后再保存")
+        encoded=json.dumps(materials, ensure_ascii=False, sort_keys=True)
+        version=previous["version"]+1
+        db.execute("""INSERT INTO submissions VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(team_id) DO UPDATE SET
+          version=excluded.version,draft_json=excluded.draft_json,submitted_json=excluded.submitted_json,
+          submitted_version=excluded.submitted_version,first_submitted_at=excluded.first_submitted_at,
+          submitted_at=excluded.submitted_at,updated_at=excluded.updated_at""",
+          (team["id"], version, encoded, encoded if submitted else (json.dumps(previous["submitted"], ensure_ascii=False, sort_keys=True) if previous["submitted"] else None),
+           version if submitted else previous["submittedVersion"], (previous["firstSubmittedAt"] or current) if submitted else previous["firstSubmittedAt"],
+           current if submitted else previous["submittedAt"], current))
+        if submitted:
+            db.execute("UPDATE teams SET project=?,updated_at=? WHERE id=?", (materials["projectName"], current, team["id"]))
+            self.touch(db)
+        self.audit(db, actor, "submission."+body["status"], team["id"], {"version": version})
+        updated=db.execute("SELECT * FROM teams WHERE id=?", (team["id"],)).fetchone()
+        return {"ok": True, **self.team_submission_response(db, updated)}
+
+    def judge_submissions(self, db):
+        return [{"teamId": row["team_id"], "materials": json.loads(row["submitted_json"]), "version": row["submitted_version"],
+                 "firstSubmittedAt": row["first_submitted_at"], "submittedAt": row["submitted_at"]}
+                for row in db.execute("SELECT * FROM submissions WHERE submitted_json IS NOT NULL ORDER BY team_id")]
+
+    def admin_submissions(self, db):
+        rows=db.execute("""SELECT t.id AS team_id,a.id AS account_id,a.active FROM teams t
+          LEFT JOIN team_accounts b ON b.team_id=t.id LEFT JOIN accounts a ON a.id=b.account_id ORDER BY t.number""")
+        return [{"teamId": row["team_id"], "access": {"id": row["account_id"], "active": bool(row["active"])} if row["account_id"] else None,
+                 "submission": self.submission(db, row["team_id"])} for row in rows]
+
+    def submission_csv(self, db):
+        fields=("projectName", "summary", "codeUrl", "readmeUrl", "license", "licenseUrl", "demoUrl", "demoInstructions", "slidesUrl", "videoUrl", "sourcesAndLimitations", "codeVersion", "confirmed")
+        output=io.StringIO(newline="")
+        writer=csv.writer(output)
+        writer.writerow(["队号", "队名", "赛道", "展示作品名", "提交状态", "编辑版本", "正式版本", "首次提交时间", "正式提交时间", "更新时间", "有未提交修改",
+                         *["正式_"+key for key in fields], *["草稿_"+key for key in fields]])
+        for team in db.execute("SELECT * FROM teams ORDER BY number"):
+            record=self.submission(db, team["id"])
+            state="已提交且有草稿修改" if record["hasUnsubmittedChanges"] else "已正式提交" if record["submitted"] else "草稿" if record["draft"] else "未保存"
+            writer.writerow([csv_safe(value) for value in [team["number"], team["name"], team["track"], team["project"], state, record["version"], record["submittedVersion"],
+                             record["firstSubmittedAt"], record["submittedAt"], record["updatedAt"], record["hasUnsubmittedChanges"],
+                             *[(record["submitted"] or {}).get(key, "") for key in fields], *[(record["draft"] or {}).get(key, "") for key in fields]]])
+        return ("\ufeff"+output.getvalue()).encode("utf-8")
 
     def team_exists(self, db, team_id):
         if not isinstance(team_id, str) or len(team_id) > 80:
@@ -517,8 +734,8 @@ class EventHandler(BaseHTTPRequestHandler):
                         length = int(self.headers.get("Content-Length", "-1"))
                     except ValueError:
                         raise APIError(400, "请求长度不正确")
-                    if length < 0 or length > BODY_LIMIT:
-                        raise APIError(413, "请求内容超过16KB限制")
+                    if length < 0 or length > (SUBMISSION_BODY_LIMIT if path=="/api/submission" else BODY_LIMIT):
+                        raise APIError(413, "请求内容超过32KB限制" if path=="/api/submission" else "请求内容超过16KB限制")
                     if self.headers.get_content_type() != "application/json":
                         raise APIError(415, "请使用JSON请求")
                     try:
@@ -541,7 +758,7 @@ class EventHandler(BaseHTTPRequestHandler):
                     if service.secure:
                         cookie += "; Secure"
                 if isinstance(value, bytes):
-                    self.headers_out(200, "text/csv; charset=utf-8", len(value), extra={"Content-Disposition": 'attachment; filename="gotc-scores.csv"'})
+                    self.headers_out(200, "text/csv; charset=utf-8", len(value), extra={"Content-Disposition": 'attachment; filename="gotc-submissions.csv"' if path=="/api/admin/submissions/export" else 'attachment; filename="gotc-scores.csv"'})
                     self.wfile.write(value)
                 else:
                     self.respond(200, value, cookie)
