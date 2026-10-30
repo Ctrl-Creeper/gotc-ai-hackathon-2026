@@ -43,3 +43,54 @@ test('numeric score events submit numeric values and do not let a late save repl
   form.isConnected=false;main.innerHTML='OTHER_TEAM_UNSAVED';vm.runInContext("selectedTeam='T2';scoreDirty=true;",ctx);resolveSave();await saving;
   assert.equal(main.innerHTML,'OTHER_TEAM_UNSAVED');assert.equal(vm.runInContext('scoreDirty',ctx),true);
 });
+
+function realRouteHarness(hash){
+  const inputs=Array.from({length:6},(_,i)=>({value:'0',dataset:{score:String(i)},disabled:false}));
+  const sliders=inputs.map((_,i)=>({value:'0',dataset:{slider:String(i)},disabled:false}));
+  const form={elements:{feedback:{value:''},...Object.fromEntries(inputs.map((input,i)=>[`score${i}`,input]))},addEventListener(){},querySelectorAll:selector=>selector==='[data-score]'?inputs:selector==='[data-slider]'?sliders:[],querySelector:()=>({})};
+  const elements={'platform-main':{innerHTML:''},'team-picker':{innerHTML:''},'judge-editor':{innerHTML:''},'score-form':form,'score-total':{innerHTML:''},'save-draft':{},recuse:{},'board-content':{innerHTML:''},'live-status':{innerHTML:'',classList:{remove(){}}}};
+  const requests=[];
+  const team={id:'T1',number:1,name:'Actual numeric team',score:82.5,rank:1,judgeCount:5};
+  const ctx=vm.createContext({document:{getElementById:id=>elements[id]??={},querySelectorAll:()=>[],body:{classList:{remove(){},contains:()=>false}}},location:{href:`https://example.test/platform.html${hash}`,hash},URL,Date,setTimeout:()=>0,clearTimeout,fetch:async(url,options)=>{requests.push({path:url.pathname,method:options.method});const body=url.pathname.endsWith('/judge')?{teams:[team],myScores:[],dimensions:[20,20,20,15,15,10].map((max,i)=>({name:`Dimension ${i}`,max})),scoringOpen:true,submissions:[]}:{teams:[team],config:{minJudges:5,resultsPublished:true,scoringOpen:true}};return {ok:true,json:async()=>body};}});
+  vm.runInContext(source+"\nsession={role:'judge',name:'Synthetic Judge'};account=()=>{};",ctx);
+  return {ctx,elements,requests};
+}
+
+test('real judge route loads the original API and renders all six numeric score inputs',async()=>{
+  const {ctx,elements,requests}=realRouteHarness('#judge');await vm.runInContext('renderRoute()',ctx);
+  assert.deepEqual(requests,[{path:'/api/judge',method:'GET'}]);
+  const html=elements['judge-editor'].innerHTML;
+  assert.equal((html.match(/type="number"/g) || []).length,6);
+  assert.equal((html.match(/data-score="\d"/g) || []).length,6);
+  assert.match(html,/id="score-form"/);assert.match(html,/id="score-total"/);
+  assert(!html.includes('id="review-form"'));
+});
+
+test('real board route loads the original API and renders numeric score and rank',async()=>{
+  const {ctx,elements,requests}=realRouteHarness('#board');await vm.runInContext('renderRoute()',ctx);
+  assert.deepEqual(requests,[{path:'/api/board',method:'GET'}]);
+  assert.match(elements['board-content'].innerHTML,/82\.50/);
+  assert.match(elements['board-content'].innerHTML,/class="rank">01<\/td>/);
+  assert.match(elements['board-content'].innerHTML,/专业均分/);
+});
+
+test('professional settings edited during their POST retain new values and unsaved-input protection',async()=>{
+  let resolvePost;let sent;const listeners=[],button={disabled:false,isConnected:true},error={textContent:''};
+  const settings={isConnected:true,elements:{scoringOpen:{checked:true},resultsPublished:{checked:false},minJudges:{value:'1'}},addEventListener(type,listener){if(type==='input')listeners.push(listener);},closest:()=>null,querySelector:selector=>selector==='.form-error'?error:button};
+  const root={innerHTML:'',insertAdjacentHTML(_position,html){this.innerHTML+=html;},querySelectorAll:()=>[settings]};
+  const elements={'platform-main':root,'settings-form':settings,'platform-toast':{textContent:'',classList:{add(){},remove(){}}}};
+  const ctx=vm.createContext({document:{getElementById:id=>elements[id]??={isConnected:true},querySelectorAll:()=>[]},location:{href:'https://example.test/platform.html#admin'},URL,Date,setTimeout:()=>0,clearTimeout,confirm:()=>false,fetch:async(url,options)=>{
+    if(options.method==='POST'){sent=JSON.parse(options.body);return new Promise(resolve=>{resolvePost=()=>resolve({ok:true,json:async()=>({ok:true})});});}
+    return {ok:true,json:async()=>url.pathname.endsWith('/admin')?{config:{},teams:[],judges:[],audience:[]}:{stage:{id:'exhibition'},roster:{judgeIds:[]},reviews:[]}};
+  }});
+  vm.runInContext(source+"\nroute='admin';routeVersion=1;installJudgingAdmin=()=>{};installSubmissionAdmin=()=>{};",ctx);
+  await vm.runInContext('renderAdmin(1)',ctx);
+  listeners.forEach(listener=>listener());
+  const saving=settings.onsubmit({preventDefault(){}});await new Promise(resolve=>setImmediate(resolve));
+  settings.elements.minJudges.value='3';settings.elements.resultsPublished.checked=true;listeners.forEach(listener=>listener());
+  resolvePost();await saving;
+  assert.equal(sent.minJudges,1);assert.equal(sent.resultsPublished,false);
+  assert.equal(settings.elements.minJudges.value,'3');assert.equal(settings.elements.resultsPublished.checked,true);
+  assert.equal(vm.runInContext('confirmLeave()',ctx),false,'Later edits must still require an unsaved-input confirmation');
+  assert.match(elements['platform-toast'].textContent,/新输入已保留/);
+});
