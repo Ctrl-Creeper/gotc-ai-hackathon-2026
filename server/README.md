@@ -101,9 +101,9 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 ## 展示评审框架
 
-新版展示入口使用 `/api/judging/exhibition`。它保存真实的定性评审记录，**数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成假成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
+独立展示入口 `platform.html#judge-exhibition` 使用 `/api/judging/exhibition`，进度页为 `#board-exhibition`。它保存真实的定性评审记录，**该新阶段的数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成假成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
 
-现有 `/api/score`、`/api/judge`、`/api/board` 和评分 CSV 保留为旧单阶段兼容接口。旧分数既不迁入新展示轮次，也不参与新版进度页；兼容接口的写入仍只保存到旧 `scores` 表。主界面使用新版展示接口，不能把历史旧分数当作本轮正式结果。
+现有 `#judge`、`#board` 继续提供原六维评分与成绩看板，使用 `/api/score`、`/api/judge`、`/api/board`；后台保留 `scoringOpen`、`minJudges`、`resultsPublished` 及原评分 CSV。原分数只保存到 `scores`，既不迁入展示轮次，也不参与 `#board-exhibition` 的记录进度。新阶段的 `scores:null` 和发布 409 不适用于原专业评分接口。
 
 | 方法与路径 | 身份 | 合同 |
 |---|---|---|
